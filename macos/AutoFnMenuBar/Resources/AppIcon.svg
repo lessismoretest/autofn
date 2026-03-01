@@ -1,0 +1,14 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <rect x="96" y="96" width="832" height="832" rx="204" fill="#0B0B0F"/>
+
+  <!-- Minimal geometric I-beam: black fill + white outline -->
+  <g>
+    <rect x="430" y="250" width="164" height="70" rx="18" fill="#0A0A0A" stroke="#FFFFFF" stroke-width="18"/>
+    <rect x="490" y="292" width="44" height="434" rx="14" fill="#0A0A0A" stroke="#FFFFFF" stroke-width="18"/>
+    <rect x="430" y="698" width="164" height="70" rx="18" fill="#0A0A0A" stroke="#FFFFFF" stroke-width="18"/>
+  </g>
+
+  <!-- Command badge: monochrome -->
+  <rect x="708" y="712" width="150" height="114" rx="28" fill="#FFFFFF"/>
+  <text x="783" y="788" text-anchor="middle" font-family="SF Pro Display, Helvetica, Arial, sans-serif" font-size="66" font-weight="700" fill="#111111">⌘</text>
+</svg>
