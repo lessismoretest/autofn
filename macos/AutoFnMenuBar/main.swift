@@ -46,6 +46,20 @@ struct Hotkey {
     let holdMode: Bool
 }
 
+enum TriggerMode: String {
+    case focus
+    case longPress
+
+    var label: String {
+        switch self {
+        case .focus:
+            return "Focus/Blur"
+        case .longPress:
+            return "Long Press In Input"
+        }
+    }
+}
+
 final class FocusAXObserverManager {
     private var observer: AXObserver?
     private var observedPID: pid_t = 0
@@ -116,6 +130,47 @@ final class FocusAXObserverManager {
 
     deinit {
         teardown()
+    }
+}
+
+final class MousePressMonitor {
+    private var globalMonitor: Any?
+    private var localMonitor: Any?
+    var onLeftMouseDown: (() -> Void)?
+    var onLeftMouseUp: (() -> Void)?
+
+    func start() {
+        stop()
+        let mask: NSEvent.EventTypeMask = [.leftMouseDown, .leftMouseUp]
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] event in
+            self?.handle(event.type)
+        }
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
+            self?.handle(event.type)
+            return event
+        }
+    }
+
+    func stop() {
+        if let globalMonitor {
+            NSEvent.removeMonitor(globalMonitor)
+            self.globalMonitor = nil
+        }
+        if let localMonitor {
+            NSEvent.removeMonitor(localMonitor)
+            self.localMonitor = nil
+        }
+    }
+
+    private func handle(_ type: NSEvent.EventType) {
+        switch type {
+        case .leftMouseDown:
+            onLeftMouseDown?()
+        case .leftMouseUp:
+            onLeftMouseUp?()
+        default:
+            break
+        }
     }
 }
 
@@ -238,7 +293,12 @@ final class AutoFnController {
     private var falseStreak = 0
     private let releaseDebounceTicks = 4
     private var lastInputRect: CGRect?
+    private var longPressArmed = false
+    private var longPressActive = false
+    private var pendingLongPressWorkItem: DispatchWorkItem?
+    private let longPressThreshold: TimeInterval = 0.30
     var triggerHotkey = Hotkey(keyCode: 18, flags: .maskCommand, spec: "cmd+1", holdMode: false)
+    var triggerMode: TriggerMode = .focus
     var addressBarCountsAsInput = true
     var onTestPrompt: ((String, CGRect?) -> Void)?
 
@@ -252,14 +312,61 @@ final class AutoFnController {
     func stop() {
         timer?.invalidate()
         timer = nil
+        cancelPendingLongPress()
+        longPressActive = false
         setFnHeld(false)
     }
 
     func setEnabled(_ value: Bool) {
         enabled = value
         if !value {
+            cancelPendingLongPress()
+            longPressActive = false
             setFnHeld(false)
         }
+    }
+
+    func setTriggerMode(_ mode: TriggerMode) {
+        guard triggerMode != mode else { return }
+        triggerMode = mode
+        cancelPendingLongPress()
+        longPressArmed = false
+        longPressActive = false
+        falseStreak = 0
+        setFnHeld(false)
+    }
+
+    func handleLeftMouseDown() {
+        guard enabled, triggerMode == .longPress else { return }
+        let focusState = detectFocusedInputState()
+        guard focusState.shouldHold else {
+            cancelPendingLongPress()
+            return
+        }
+        cancelPendingLongPress()
+        longPressArmed = true
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.enabled, self.triggerMode == .longPress, self.longPressArmed else { return }
+            self.longPressActive = true
+            self.setFnHeld(true, signature: focusState.signature, focusRect: focusState.focusRect)
+        }
+        pendingLongPressWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + longPressThreshold, execute: work)
+    }
+
+    func handleLeftMouseUp() {
+        guard triggerMode == .longPress else { return }
+        cancelPendingLongPress()
+        if longPressActive {
+            longPressActive = false
+            setFnHeld(false)
+        }
+    }
+
+    private func cancelPendingLongPress() {
+        longPressArmed = false
+        pendingLongPressWorkItem?.cancel()
+        pendingLongPressWorkItem = nil
     }
 
     func evaluateNow() {
@@ -271,6 +378,7 @@ final class AutoFnController {
             setFnHeld(false)
             return
         }
+        guard triggerMode == .focus else { return }
         let focusState = detectFocusedInputState()
         let rawHold = focusState.shouldHold
         let effectiveHold: Bool
@@ -649,13 +757,16 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
     private let enabledMenuItem = NSMenuItem(title: "Enabled", action: #selector(toggleEnabled), keyEquivalent: "e")
     private let launchAtLoginMenuItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "l")
     private let addressBarInputMenuItem = NSMenuItem(title: "Address Bar Counts As Input", action: #selector(toggleAddressBarCountsAsInput), keyEquivalent: "")
+    private let triggerModeMenuItem = NSMenuItem(title: "Trigger Mode", action: nil, keyEquivalent: "")
     private let hotkeyMenuItem = NSMenuItem(title: "Trigger Hotkey", action: nil, keyEquivalent: "")
     private let accessMenuItem = NSMenuItem(title: "Open Accessibility Settings", action: #selector(openAccessibility), keyEquivalent: "")
     private let launchAgentLabel = "com.lessismore.autofnmenubar.login"
     private let hotkeyDefaultsKey = "AutoFnMenuBar.TriggerHotkeySpec"
     private let addressBarInputDefaultsKey = "AutoFnMenuBar.AddressBarCountsAsInput"
+    private let triggerModeDefaultsKey = "AutoFnMenuBar.TriggerMode"
     private let hotkeyPresets = ["test", "fn", "cmd+1", "ctrl+space", "cmd+space", "alt+space"]
     private let focusObserverManager = FocusAXObserverManager()
+    private let mousePressMonitor = MousePressMonitor()
     private let testPromptOverlay = TestPromptOverlay()
     private var appActivateObserver: NSObjectProtocol?
 
@@ -664,6 +775,7 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
         setupStatusItem()
         loadHotkeyFromDefaults()
         loadAddressBarInputFromDefaults()
+        loadTriggerModeFromDefaults()
         controller.onTestPrompt = { [weak self] message, rect in
             self?.showTestPrompt(message, near: rect)
         }
@@ -671,6 +783,13 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
             self?.controller.evaluateNow()
         }
         focusObserverManager.start()
+        mousePressMonitor.onLeftMouseDown = { [weak self] in
+            self?.controller.handleLeftMouseDown()
+        }
+        mousePressMonitor.onLeftMouseUp = { [weak self] in
+            self?.controller.handleLeftMouseUp()
+        }
+        mousePressMonitor.start()
         appActivateObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: NSWorkspace.shared,
@@ -694,6 +813,7 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
             NSWorkspace.shared.notificationCenter.removeObserver(appActivateObserver)
             self.appActivateObserver = nil
         }
+        mousePressMonitor.stop()
         focusObserverManager.stop()
         controller.stop()
     }
@@ -747,6 +867,9 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
         addressBarInputMenuItem.state = controller.addressBarCountsAsInput ? .on : .off
         menu.addItem(addressBarInputMenuItem)
 
+        triggerModeMenuItem.submenu = makeTriggerModeSubmenu()
+        menu.addItem(triggerModeMenuItem)
+
         hotkeyMenuItem.submenu = makeHotkeySubmenu()
         menu.addItem(hotkeyMenuItem)
 
@@ -774,6 +897,18 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
         custom.target = self
         submenu.addItem(custom)
         refreshHotkeyMenuState()
+        return submenu
+    }
+
+    private func makeTriggerModeSubmenu() -> NSMenu {
+        let submenu = NSMenu(title: "Trigger Mode")
+        for mode in [TriggerMode.focus, TriggerMode.longPress] {
+            let item = NSMenuItem(title: mode.label, action: #selector(selectTriggerMode(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = mode.rawValue
+            submenu.addItem(item)
+        }
+        refreshTriggerModeMenuState()
         return submenu
     }
 
@@ -806,6 +941,13 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
         addressBarInputMenuItem.state = controller.addressBarCountsAsInput ? .on : .off
     }
 
+    private func loadTriggerModeFromDefaults() {
+        let stored = UserDefaults.standard.string(forKey: triggerModeDefaultsKey) ?? TriggerMode.focus.rawValue
+        let mode = TriggerMode(rawValue: stored) ?? .focus
+        controller.setTriggerMode(mode)
+        refreshTriggerModeMenuState()
+    }
+
     func addressBarCountsAsInputEnabled() -> Bool {
         controller.addressBarCountsAsInput
     }
@@ -823,6 +965,18 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
             }
         }
         hotkeyMenuItem.title = "Trigger Hotkey (\(controller.triggerHotkey.spec))"
+    }
+
+    private func refreshTriggerModeMenuState() {
+        guard let submenu = triggerModeMenuItem.submenu else { return }
+        for item in submenu.items {
+            guard let raw = item.representedObject as? String, let mode = TriggerMode(rawValue: raw) else {
+                item.state = .off
+                continue
+            }
+            item.state = (mode == controller.triggerMode) ? .on : .off
+        }
+        triggerModeMenuItem.title = "Trigger Mode (\(controller.triggerMode.label))"
     }
 
     private func showTestPrompt(_ message: String, near rect: CGRect?) {
@@ -929,6 +1083,14 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
     @objc private func selectHotkeyPreset(_ sender: NSMenuItem) {
         guard let spec = sender.representedObject as? String else { return }
         setTriggerHotkey(spec)
+    }
+
+    @objc private func selectTriggerMode(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let mode = TriggerMode(rawValue: raw) else { return }
+        controller.setTriggerMode(mode)
+        UserDefaults.standard.set(mode.rawValue, forKey: triggerModeDefaultsKey)
+        refreshTriggerModeMenuState()
+        controller.evaluateNow()
     }
 
     @objc private func selectCustomHotkey() {
