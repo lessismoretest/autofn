@@ -24,6 +24,14 @@ bash scripts/build_auto_fn_menu_bar_app.sh
 open dist/AutoFn.app
 ```
 
+DMG 打包：
+
+```bash
+cd /Users/lessismore/Code/autofn
+bash scripts/build_auto_fn_menu_bar_app.sh
+bash scripts/build_dmg.sh
+```
+
 ## 注意
 
 - 需要在 macOS「系统设置 -> 隐私与安全性 -> 辅助功能」里给运行主体授权（终端或 AutoFnMenuBar.app）。
