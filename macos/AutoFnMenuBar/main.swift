@@ -3,7 +3,7 @@ import ApplicationServices
 import CoreGraphics
 import Foundation
 
-private let pollInterval: TimeInterval = 0.06
+private let pollInterval: TimeInterval = 0.25
 private let inputRoles: Set<String> = [
     "AXTextField",
     "AXTextArea",
@@ -11,12 +11,184 @@ private let inputRoles: Set<String> = [
     "AXComboBox",
     "AXDocument",
 ]
+private let accessibilityBoostAttributes: [CFString] = [
+    "AXEnhancedUserInterface" as CFString,
+    "AXManualAccessibility" as CFString,
+]
+private let accessibilityBoostCooldown: TimeInterval = 2.0
+private var lastAccessibilityBoostByPID: [pid_t: TimeInterval] = [:]
+private let chromiumBrowserBundleIDs: Set<String> = [
+    "com.google.Chrome",
+    "org.chromium.Chromium",
+    "com.brave.Browser",
+    "com.brave.Browser.beta",
+    "com.brave.Browser.nightly",
+    "com.microsoft.edgemac",
+    "company.thebrowser.dia",
+]
+private let firefoxBrowserBundleIDs: Set<String> = [
+    "org.mozilla.firefox",
+    "org.mozilla.nightly",
+    "org.mozilla.firefoxdeveloperedition",
+    "app.zen-browser.zen",
+]
+
+struct FocusDetectionState {
+    let shouldHold: Bool
+    let signature: String
+    let focusRect: CGRect?
+}
 
 struct Hotkey {
     let keyCode: CGKeyCode
     let flags: CGEventFlags
     let spec: String
     let holdMode: Bool
+}
+
+final class FocusAXObserverManager {
+    private var observer: AXObserver?
+    private var observedPID: pid_t = 0
+    var onEvent: (() -> Void)?
+
+    func start() {
+        rebindToFrontmostApp()
+    }
+
+    func stop() {
+        teardown()
+    }
+
+    func rebindToFrontmostApp() {
+        if let app = NSWorkspace.shared.frontmostApplication {
+            rebind(pid: app.processIdentifier)
+        } else {
+            teardown()
+        }
+    }
+
+    func rebind(pid: pid_t) {
+        guard pid > 0 else {
+            teardown()
+            return
+        }
+        if observedPID == pid, observer != nil {
+            return
+        }
+
+        teardown()
+
+        var newObserver: AXObserver?
+        let err = AXObserverCreate(pid, { _, _, _, refcon in
+            guard let refcon else { return }
+            let manager = Unmanaged<FocusAXObserverManager>.fromOpaque(refcon).takeUnretainedValue()
+            manager.onEvent?()
+        }, &newObserver)
+        guard err == .success, let axObserver = newObserver else {
+            observedPID = 0
+            observer = nil
+            return
+        }
+
+        let appElement = AXUIElementCreateApplication(pid)
+        let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        let notifications: [CFString] = [
+            kAXFocusedUIElementChangedNotification as CFString,
+            kAXFocusedWindowChangedNotification as CFString,
+            kAXWindowCreatedNotification as CFString,
+        ]
+        for notification in notifications {
+            _ = AXObserverAddNotification(axObserver, appElement, notification, refcon)
+        }
+
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(axObserver), .defaultMode)
+        observer = axObserver
+        observedPID = pid
+    }
+
+    private func teardown() {
+        if let observer {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        }
+        observer = nil
+        observedPID = 0
+    }
+
+    deinit {
+        teardown()
+    }
+}
+
+final class TestPromptOverlay {
+    private let panel: NSPanel
+    private let label: NSTextField
+    private var hideWorkItem: DispatchWorkItem?
+
+    init() {
+        panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 260, height: 40),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 0.88)
+        panel.level = .statusBar
+        panel.hasShadow = true
+        panel.ignoresMouseEvents = true
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
+
+        label = NSTextField(labelWithString: "")
+        label.textColor = .white
+        label.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        label.alignment = .center
+        label.lineBreakMode = .byTruncatingTail
+
+        let content = NSView(frame: panel.contentRect(forFrameRect: panel.frame))
+        content.wantsLayer = true
+        content.layer?.cornerRadius = 8
+        content.layer?.masksToBounds = true
+        label.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
+            label.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
+            label.topAnchor.constraint(equalTo: content.topAnchor, constant: 7),
+            label.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -7),
+        ])
+        panel.contentView = content
+    }
+
+    func show(_ message: String, near anchorRect: CGRect?) {
+        let textWidth = (message as NSString).size(withAttributes: [.font: label.font as Any]).width
+        let width = min(max(textWidth + 24, 180), 360)
+        let height: CGFloat = 34
+
+        let anchor = anchorRect ?? CGRect(origin: NSEvent.mouseLocation, size: .zero)
+        let x = anchor.maxX + 10
+        let y = anchor.maxY + 10
+        var frame = NSRect(x: x, y: y, width: width, height: height)
+
+        if let screen = NSScreen.screens.first(where: { $0.frame.intersects(frame) }) ?? NSScreen.main {
+            let visible = screen.visibleFrame
+            if frame.maxX > visible.maxX { frame.origin.x = max(visible.maxX - frame.width - 8, visible.minX + 8) }
+            if frame.maxY > visible.maxY { frame.origin.y = max(anchor.minY - frame.height - 10, visible.minY + 8) }
+            if frame.minX < visible.minX { frame.origin.x = visible.minX + 8 }
+            if frame.minY < visible.minY { frame.origin.y = visible.minY + 8 }
+        }
+
+        label.stringValue = message
+        panel.setFrame(frame, display: true)
+        panel.orderFrontRegardless()
+
+        hideWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.panel.orderOut(nil)
+        }
+        hideWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.1, execute: work)
+    }
 }
 
 func keyCodeForToken(_ token: String) -> CGKeyCode? {
@@ -34,6 +206,9 @@ func keyCodeForToken(_ token: String) -> CGKeyCode? {
 func parseHotkey(_ spec: String) -> Hotkey? {
     if spec.lowercased() == "fn" {
         return Hotkey(keyCode: 63, flags: [], spec: spec, holdMode: true)
+    }
+    if spec.lowercased() == "test" {
+        return Hotkey(keyCode: 0, flags: [], spec: "test", holdMode: false)
     }
     let parts = spec.lowercased().split(separator: "+").map { String($0) }.filter { !$0.isEmpty }
     guard let keyToken = parts.last, let keyCode = keyCodeForToken(keyToken) else { return nil }
@@ -62,7 +237,10 @@ final class AutoFnController {
     private var lastInputSignature = ""
     private var falseStreak = 0
     private let releaseDebounceTicks = 4
+    private var lastInputRect: CGRect?
     var triggerHotkey = Hotkey(keyCode: 18, flags: .maskCommand, spec: "cmd+1", holdMode: false)
+    var addressBarCountsAsInput = true
+    var onTestPrompt: ((String, CGRect?) -> Void)?
 
     func start() {
         stop()
@@ -84,12 +262,17 @@ final class AutoFnController {
         }
     }
 
+    func evaluateNow() {
+        tick()
+    }
+
     private func tick() {
         guard enabled else {
             setFnHeld(false)
             return
         }
-        let rawHold = shouldHoldFnForFocusedElement()
+        let focusState = detectFocusedInputState()
+        let rawHold = focusState.shouldHold
         let effectiveHold: Bool
         if rawHold {
             falseStreak = 0
@@ -98,10 +281,10 @@ final class AutoFnController {
             falseStreak += 1
             effectiveHold = fnHeld && falseStreak < releaseDebounceTicks
         }
-        setFnHeld(effectiveHold)
+        setFnHeld(effectiveHold, signature: focusState.signature, focusRect: focusState.focusRect)
     }
 
-    private func setFnHeld(_ target: Bool) {
+    private func setFnHeld(_ target: Bool, signature: String = "", focusRect: CGRect? = nil) {
         if triggerHotkey.holdMode {
             if fnHeld != target {
                 postFn(pressed: target)
@@ -111,10 +294,17 @@ final class AutoFnController {
         }
 
         if target {
-            let signature = currentFocusedInputSignature()
             let shouldTrigger = (!fnHeld) || (signature != lastInputSignature)
             if shouldTrigger {
-                sendHotkey(triggerHotkey)
+                if triggerHotkey.spec.lowercased() == "test" {
+                    let anchor = focusRect ?? lastInputRect
+                    onTestPrompt?("测试模式：输入框已聚焦（未触发快捷键）", anchor)
+                } else {
+                    sendHotkey(triggerHotkey)
+                }
+                if let focusRect {
+                    lastInputRect = focusRect
+                }
                 lastInputSignature = signature
                 fnHeld = true
             }
@@ -122,8 +312,12 @@ final class AutoFnController {
         }
 
         if fnHeld {
+            if triggerHotkey.spec.lowercased() == "test" {
+                onTestPrompt?("测试模式：输入框已失焦（未触发快捷键）", lastInputRect)
+            }
             fnHeld = false
             lastInputSignature = ""
+            lastInputRect = nil
         }
     }
 }
@@ -164,6 +358,18 @@ func copyElementArrayAttr(_ element: AXUIElement, _ attr: CFString) -> [AXUIElem
     return []
 }
 
+func copyStringArrayAttr(_ element: AXUIElement, _ attr: CFString) -> [String] {
+    let (err, value) = copyAttr(element, attr)
+    guard err == .success, let v = value else { return [] }
+    if let arr = v as? [String] {
+        return arr
+    }
+    if let anyArr = v as? [Any] {
+        return anyArr.compactMap { $0 as? String }
+    }
+    return []
+}
+
 func copyCGPointAttr(_ element: AXUIElement, _ attr: CFString) -> CGPoint? {
     let (err, value) = copyAttr(element, attr)
     guard err == .success, let v = value else { return nil }
@@ -182,6 +388,92 @@ func copyCGSizeAttr(_ element: AXUIElement, _ attr: CFString) -> CGSize? {
     var size = CGSize.zero
     guard AXValueGetValue(axValue, .cgSize, &size) else { return nil }
     return size
+}
+
+func convertAXRectToAppKit(_ rect: CGRect) -> CGRect {
+    for screen in NSScreen.screens {
+        let convertedY = screen.frame.maxY - rect.origin.y - rect.height
+        let converted = CGRect(x: rect.origin.x, y: convertedY, width: rect.width, height: rect.height)
+        if screen.frame.intersects(converted) {
+            return converted
+        }
+    }
+    if let main = NSScreen.main {
+        return CGRect(
+            x: rect.origin.x,
+            y: main.frame.maxY - rect.origin.y - rect.height,
+            width: rect.width,
+            height: rect.height
+        )
+    }
+    return rect
+}
+
+func focusedElementRect(_ element: AXUIElement) -> CGRect? {
+    guard let pos = copyCGPointAttr(element, kAXPositionAttribute as CFString),
+          let size = copyCGSizeAttr(element, kAXSizeAttribute as CFString)
+    else { return nil }
+    return convertAXRectToAppKit(CGRect(origin: pos, size: size))
+}
+
+func elementPID(_ element: AXUIElement) -> pid_t? {
+    var pid: pid_t = 0
+    guard AXUIElementGetPid(element, &pid) == .success else { return nil }
+    return pid
+}
+
+func boostAppAccessibilityAttribute(_ appElement: AXUIElement, attribute: CFString) {
+    var settable = DarwinBoolean(false)
+    guard AXUIElementIsAttributeSettable(appElement, attribute, &settable) == .success, settable.boolValue else {
+        return
+    }
+    if let enabled = copyBoolAttr(appElement, attribute), enabled {
+        return
+    }
+    _ = AXUIElementSetAttributeValue(appElement, attribute, kCFBooleanTrue)
+}
+
+func maybeBoostAppAccessibility(for pid: pid_t) {
+    guard pid > 0 else { return }
+    let now = Date().timeIntervalSince1970
+    if let last = lastAccessibilityBoostByPID[pid], now - last < accessibilityBoostCooldown {
+        return
+    }
+    lastAccessibilityBoostByPID[pid] = now
+    let appElement = AXUIElementCreateApplication(pid)
+    for attribute in accessibilityBoostAttributes {
+        boostAppAccessibilityAttribute(appElement, attribute: attribute)
+    }
+}
+
+func elementBundleIdentifier(_ element: AXUIElement) -> String? {
+    guard let pid = elementPID(element), pid > 0 else { return nil }
+    return NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+}
+
+func isBrowserAddressBar(_ element: AXUIElement) -> Bool {
+    guard let bundleID = elementBundleIdentifier(element) else { return false }
+
+    if bundleID == "com.apple.Safari" || bundleID == "com.apple.SafariTechnologyPreview" {
+        return copyStringAttr(element, "AXIdentifier" as CFString) == "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD"
+    }
+    if bundleID == "company.thebrowser.Browser" {
+        return copyStringAttr(element, "AXIdentifier" as CFString) == "commandBarTextField"
+    }
+    if bundleID == "com.vivaldi.Vivaldi" {
+        let classes = Set(copyStringArrayAttr(element, "AXDOMClassList" as CFString))
+        return classes.contains("UrlBar-UrlField") && classes.contains("vivaldi-addressfield")
+    }
+    if bundleID == "com.operasoftware.Opera" {
+        return copyStringArrayAttr(element, "AXDOMClassList" as CFString).contains("AddressTextfieldView")
+    }
+    if chromiumBrowserBundleIDs.contains(bundleID) {
+        return copyStringArrayAttr(element, "AXDOMClassList" as CFString).contains("OmniboxViewViews")
+    }
+    if firefoxBrowserBundleIDs.contains(bundleID) {
+        return copyStringAttr(element, "AXDOMIdentifier" as CFString) == "urlbar-input"
+    }
+    return false
 }
 
 @inline(__always)
@@ -243,19 +535,30 @@ func focusedElement() -> AXUIElement? {
     let systemWide = AXUIElementCreateSystemWide()
     let (errSystemFocused, systemFocused) = copyAttr(systemWide, kAXFocusedUIElementAttribute as CFString)
     if errSystemFocused == .success, let raw = systemFocused {
-        return (raw as! AXUIElement)
+        let element = raw as! AXUIElement
+        if let pid = elementPID(element) {
+            maybeBoostAppAccessibility(for: pid)
+        }
+        return element
     }
 
     let app: AXUIElement
+    var appPID: pid_t?
     let (errApp, appRef) = copyAttr(systemWide, kAXFocusedApplicationAttribute as CFString)
     if errApp == .success, let rawApp = appRef {
         app = rawApp as! AXUIElement
+        appPID = elementPID(app)
     } else if let pid = frontmostWindowAppPID() {
         app = AXUIElementCreateApplication(pid)
+        appPID = pid
     } else if let frontmost = NSWorkspace.shared.frontmostApplication {
         app = AXUIElementCreateApplication(frontmost.processIdentifier)
+        appPID = frontmost.processIdentifier
     } else {
         return nil
+    }
+    if let pid = appPID {
+        maybeBoostAppAccessibility(for: pid)
     }
 
     let (errAppFocused, appFocused) = copyAttr(app, kAXFocusedUIElementAttribute as CFString)
@@ -274,22 +577,35 @@ func focusedElement() -> AXUIElement? {
     return nil
 }
 
-func shouldHoldFnForFocusedElement() -> Bool {
-    guard let element = focusedElement() else { return false }
+func detectFocusedInputState() -> FocusDetectionState {
+    guard let element = focusedElement() else {
+        return FocusDetectionState(shouldHold: false, signature: "", focusRect: nil)
+    }
+    let signature = focusedElementSignature(element)
+    let focusRect = focusedElementRect(element)
+    if isBrowserAddressBar(element) {
+        if let app = NSApp.delegate as? AutoFnMenuBarApp {
+            return FocusDetectionState(
+                shouldHold: app.addressBarCountsAsInputEnabled(),
+                signature: signature,
+                focusRect: focusRect
+            )
+        }
+        return FocusDetectionState(shouldHold: false, signature: signature, focusRect: focusRect)
+    }
     if isInputElement(element) {
-        return true
+        return FocusDetectionState(shouldHold: true, signature: signature, focusRect: focusRect)
     }
     if hasInputAncestor(element) {
-        return true
+        return FocusDetectionState(shouldHold: true, signature: signature, focusRect: focusRect)
     }
     if hasFocusedInputDescendant(element) {
-        return true
+        return FocusDetectionState(shouldHold: true, signature: signature, focusRect: focusRect)
     }
-    return false
+    return FocusDetectionState(shouldHold: false, signature: signature, focusRect: focusRect)
 }
 
-func currentFocusedInputSignature() -> String {
-    guard let element = focusedElement() else { return "" }
+func focusedElementSignature(_ element: AXUIElement) -> String {
     var pid: pid_t = 0
     _ = AXUIElementGetPid(element, &pid)
     let role = copyStringAttr(element, kAXRoleAttribute as CFString) ?? "-"
@@ -332,16 +648,41 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
     private let controller = AutoFnController()
     private let enabledMenuItem = NSMenuItem(title: "Enabled", action: #selector(toggleEnabled), keyEquivalent: "e")
     private let launchAtLoginMenuItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "l")
+    private let addressBarInputMenuItem = NSMenuItem(title: "Address Bar Counts As Input", action: #selector(toggleAddressBarCountsAsInput), keyEquivalent: "")
     private let hotkeyMenuItem = NSMenuItem(title: "Trigger Hotkey", action: nil, keyEquivalent: "")
     private let accessMenuItem = NSMenuItem(title: "Open Accessibility Settings", action: #selector(openAccessibility), keyEquivalent: "")
     private let launchAgentLabel = "com.lessismore.autofnmenubar.login"
     private let hotkeyDefaultsKey = "AutoFnMenuBar.TriggerHotkeySpec"
-    private let hotkeyPresets = ["fn", "cmd+1", "ctrl+space", "cmd+space", "alt+space"]
+    private let addressBarInputDefaultsKey = "AutoFnMenuBar.AddressBarCountsAsInput"
+    private let hotkeyPresets = ["test", "fn", "cmd+1", "ctrl+space", "cmd+space", "alt+space"]
+    private let focusObserverManager = FocusAXObserverManager()
+    private let testPromptOverlay = TestPromptOverlay()
+    private var appActivateObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         setupStatusItem()
         loadHotkeyFromDefaults()
+        loadAddressBarInputFromDefaults()
+        controller.onTestPrompt = { [weak self] message, rect in
+            self?.showTestPrompt(message, near: rect)
+        }
+        focusObserverManager.onEvent = { [weak self] in
+            self?.controller.evaluateNow()
+        }
+        focusObserverManager.start()
+        appActivateObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: NSWorkspace.shared,
+            queue: .main
+        ) { [weak self] note in
+            if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+                self?.focusObserverManager.rebind(pid: app.processIdentifier)
+            } else {
+                self?.focusObserverManager.rebindToFrontmostApp()
+            }
+            self?.controller.evaluateNow()
+        }
         controller.start()
         if !AXIsProcessTrusted() {
             promptAccessibilityPermission()
@@ -349,6 +690,11 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if let appActivateObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(appActivateObserver)
+            self.appActivateObserver = nil
+        }
+        focusObserverManager.stop()
         controller.stop()
     }
 
@@ -396,6 +742,10 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
         launchAtLoginMenuItem.target = self
         launchAtLoginMenuItem.state = isLaunchAtLoginEnabled() ? .on : .off
         menu.addItem(launchAtLoginMenuItem)
+
+        addressBarInputMenuItem.target = self
+        addressBarInputMenuItem.state = controller.addressBarCountsAsInput ? .on : .off
+        menu.addItem(addressBarInputMenuItem)
 
         hotkeyMenuItem.submenu = makeHotkeySubmenu()
         menu.addItem(hotkeyMenuItem)
@@ -447,6 +797,19 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
         refreshHotkeyMenuState()
     }
 
+    private func loadAddressBarInputFromDefaults() {
+        if UserDefaults.standard.object(forKey: addressBarInputDefaultsKey) == nil {
+            controller.addressBarCountsAsInput = true
+        } else {
+            controller.addressBarCountsAsInput = UserDefaults.standard.bool(forKey: addressBarInputDefaultsKey)
+        }
+        addressBarInputMenuItem.state = controller.addressBarCountsAsInput ? .on : .off
+    }
+
+    func addressBarCountsAsInputEnabled() -> Bool {
+        controller.addressBarCountsAsInput
+    }
+
     private func refreshHotkeyMenuState() {
         guard let submenu = hotkeyMenuItem.submenu else { return }
         let current = currentHotkeySpec().lowercased()
@@ -460,6 +823,11 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
             }
         }
         hotkeyMenuItem.title = "Trigger Hotkey (\(controller.triggerHotkey.spec))"
+    }
+
+    private func showTestPrompt(_ message: String, near rect: CGRect?) {
+        testPromptOverlay.show(message, near: rect)
+        NSLog("[AutoFn][test] \(message)")
     }
 
     private func launchAgentPlistPath() -> String {
@@ -552,6 +920,12 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func toggleAddressBarCountsAsInput() {
+        controller.addressBarCountsAsInput.toggle()
+        UserDefaults.standard.set(controller.addressBarCountsAsInput, forKey: addressBarInputDefaultsKey)
+        addressBarInputMenuItem.state = controller.addressBarCountsAsInput ? .on : .off
+    }
+
     @objc private func selectHotkeyPreset(_ sender: NSMenuItem) {
         guard let spec = sender.representedObject as? String else { return }
         setTriggerHotkey(spec)
@@ -560,7 +934,7 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
     @objc private func selectCustomHotkey() {
         let alert = NSAlert()
         alert.messageText = "Set Trigger Hotkey"
-        alert.informativeText = "Format: fn / cmd+1 / ctrl+space / alt+tab / shift+enter"
+        alert.informativeText = "Format: test / fn / cmd+1 / ctrl+space / alt+tab / shift+enter"
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
         input.stringValue = currentHotkeySpec()
         alert.accessoryView = input

@@ -8,6 +8,7 @@ import Foundation
 let pollIntervalUsec: useconds_t = 60_000
 let debugMode = CommandLine.arguments.contains("--debug")
 let verboseMode = CommandLine.arguments.contains("--verbose")
+let addressBarCountsAsInput = !CommandLine.arguments.contains("--no-address-bar-input")
 let hotkeySpec = {
     let args = CommandLine.arguments
     guard let idx = args.firstIndex(of: "--hotkey"), idx + 1 < args.count else { return "cmd+1" }
@@ -19,6 +20,27 @@ let inputRoles: Set<String> = [
     "AXSearchField",
     "AXComboBox",
     "AXDocument",
+]
+let accessibilityBoostAttributes: [CFString] = [
+    "AXEnhancedUserInterface" as CFString,
+    "AXManualAccessibility" as CFString,
+]
+let accessibilityBoostCooldown: TimeInterval = 2.0
+var lastAccessibilityBoostByPID: [pid_t: TimeInterval] = [:]
+let chromiumBrowserBundleIDs: Set<String> = [
+    "com.google.Chrome",
+    "org.chromium.Chromium",
+    "com.brave.Browser",
+    "com.brave.Browser.beta",
+    "com.brave.Browser.nightly",
+    "com.microsoft.edgemac",
+    "company.thebrowser.dia",
+]
+let firefoxBrowserBundleIDs: Set<String> = [
+    "org.mozilla.firefox",
+    "org.mozilla.nightly",
+    "org.mozilla.firefoxdeveloperedition",
+    "app.zen-browser.zen",
 ]
 
 var triggerArmed = false
@@ -32,6 +54,12 @@ struct Hotkey {
     let flags: CGEventFlags
     let spec: String
     let holdMode: Bool
+}
+
+struct FocusDetectionState {
+    let shouldHold: Bool
+    let reason: String
+    let signature: String
 }
 
 func keyCodeForToken(_ token: String) -> CGKeyCode? {
@@ -153,6 +181,18 @@ func copyElementArrayAttr(_ element: AXUIElement, _ attr: CFString) -> [AXUIElem
     return []
 }
 
+func copyStringArrayAttr(_ element: AXUIElement, _ attr: CFString) -> [String] {
+    let (err, value) = copyAttr(element, attr)
+    guard err == .success, let v = value else { return [] }
+    if let arr = v as? [String] {
+        return arr
+    }
+    if let anyArr = v as? [Any] {
+        return anyArr.compactMap { $0 as? String }
+    }
+    return []
+}
+
 func copyCGPointAttr(_ element: AXUIElement, _ attr: CFString) -> CGPoint? {
     let (err, value) = copyAttr(element, attr)
     guard err == .success, let v = value else { return nil }
@@ -171,6 +211,66 @@ func copyCGSizeAttr(_ element: AXUIElement, _ attr: CFString) -> CGSize? {
     var size = CGSize.zero
     guard AXValueGetValue(axValue, .cgSize, &size) else { return nil }
     return size
+}
+
+func elementPID(_ element: AXUIElement) -> pid_t? {
+    var pid: pid_t = 0
+    guard AXUIElementGetPid(element, &pid) == .success else { return nil }
+    return pid
+}
+
+func boostAppAccessibilityAttribute(_ appElement: AXUIElement, attribute: CFString) {
+    var settable = DarwinBoolean(false)
+    guard AXUIElementIsAttributeSettable(appElement, attribute, &settable) == .success, settable.boolValue else {
+        return
+    }
+    if let enabled = copyBoolAttr(appElement, attribute), enabled {
+        return
+    }
+    _ = AXUIElementSetAttributeValue(appElement, attribute, kCFBooleanTrue)
+}
+
+func maybeBoostAppAccessibility(for pid: pid_t) {
+    guard pid > 0 else { return }
+    let now = Date().timeIntervalSince1970
+    if let last = lastAccessibilityBoostByPID[pid], now - last < accessibilityBoostCooldown {
+        return
+    }
+    lastAccessibilityBoostByPID[pid] = now
+    let appElement = AXUIElementCreateApplication(pid)
+    for attribute in accessibilityBoostAttributes {
+        boostAppAccessibilityAttribute(appElement, attribute: attribute)
+    }
+}
+
+func elementBundleIdentifier(_ element: AXUIElement) -> String? {
+    guard let pid = elementPID(element), pid > 0 else { return nil }
+    return NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+}
+
+func isBrowserAddressBar(_ element: AXUIElement) -> Bool {
+    guard let bundleID = elementBundleIdentifier(element) else { return false }
+
+    if bundleID == "com.apple.Safari" || bundleID == "com.apple.SafariTechnologyPreview" {
+        return copyStringAttr(element, "AXIdentifier" as CFString) == "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD"
+    }
+    if bundleID == "company.thebrowser.Browser" {
+        return copyStringAttr(element, "AXIdentifier" as CFString) == "commandBarTextField"
+    }
+    if bundleID == "com.vivaldi.Vivaldi" {
+        let classes = Set(copyStringArrayAttr(element, "AXDOMClassList" as CFString))
+        return classes.contains("UrlBar-UrlField") && classes.contains("vivaldi-addressfield")
+    }
+    if bundleID == "com.operasoftware.Opera" {
+        return copyStringArrayAttr(element, "AXDOMClassList" as CFString).contains("AddressTextfieldView")
+    }
+    if chromiumBrowserBundleIDs.contains(bundleID) {
+        return copyStringArrayAttr(element, "AXDOMClassList" as CFString).contains("OmniboxViewViews")
+    }
+    if firefoxBrowserBundleIDs.contains(bundleID) {
+        return copyStringAttr(element, "AXDOMIdentifier" as CFString) == "urlbar-input"
+    }
+    return false
 }
 
 @inline(__always)
@@ -217,24 +317,34 @@ func focusedElement() -> (AXUIElement?, String) {
     let systemWide = AXUIElementCreateSystemWide()
     let (errSystemFocused, systemFocused) = copyAttr(systemWide, kAXFocusedUIElementAttribute as CFString)
     if errSystemFocused == .success, let raw = systemFocused {
-        let v = raw as! AXUIElement
-        return (v, "system.focusedUIElement=success")
+        let element = raw as! AXUIElement
+        if let pid = elementPID(element) {
+            maybeBoostAppAccessibility(for: pid)
+        }
+        return (element, "system.focusedUIElement=success")
     }
 
     let app: AXUIElement
+    var appPID: pid_t?
     var appReason = ""
     let (errApp, appRef) = copyAttr(systemWide, kAXFocusedApplicationAttribute as CFString)
     if errApp == .success, let rawApp = appRef {
         app = rawApp as! AXUIElement
+        appPID = elementPID(app)
         appReason = "system.focusedApp=success"
     } else if let frontWin = frontmostWindowApp() {
         app = AXUIElementCreateApplication(frontWin.0)
+        appPID = frontWin.0
         appReason = "system.focusedApp=\(axErrorName(errApp)); fallback.frontmostWindowApp=\(frontWin.1)(\(frontWin.0))"
     } else if let frontmost = NSWorkspace.shared.frontmostApplication {
         app = AXUIElementCreateApplication(frontmost.processIdentifier)
+        appPID = frontmost.processIdentifier
         appReason = "system.focusedApp=\(axErrorName(errApp)); fallback.frontmostApp=\(frontmost.localizedName ?? "pid:\(frontmost.processIdentifier)")"
     } else {
         return (nil, "system.focusedUIElement=\(axErrorName(errSystemFocused)); system.focusedApp=\(axErrorName(errApp)); fallback.frontmostApp=unavailable")
+    }
+    if let pid = appPID {
+        maybeBoostAppAccessibility(for: pid)
     }
 
     let (errAppFocused, appFocused) = copyAttr(app, kAXFocusedUIElementAttribute as CFString)
@@ -290,22 +400,47 @@ func focusedElementSignature(_ element: AXUIElement) -> String {
     return "\(pid)|\(role)|\(subrole)|\(title)|\(identifier)|\(geo)"
 }
 
-func shouldHoldFnForFocusedElement() -> (Bool, String, String) {
+func detectFocusedInputState() -> FocusDetectionState {
     let (focused, sourceReason) = focusedElement()
-    guard let element = focused else { return (false, "no_focused_element \(sourceReason)", "") }
+    guard let element = focused else {
+        return FocusDetectionState(shouldHold: false, reason: "no_focused_element \(sourceReason)", signature: "")
+    }
     let role = copyStringAttr(element, kAXRoleAttribute as CFString) ?? "unknown-role"
     let subrole = copyStringAttr(element, kAXSubroleAttribute as CFString) ?? "-"
     let signature = focusedElementSignature(element)
+    if isBrowserAddressBar(element) {
+        return FocusDetectionState(
+            shouldHold: addressBarCountsAsInput,
+            reason: "\(sourceReason) via=browser_address role=\(role) subrole=\(subrole)",
+            signature: signature
+        )
+    }
     if isInputElement(element) {
-        return (true, "\(sourceReason) role=\(role) subrole=\(subrole)", signature)
+        return FocusDetectionState(
+            shouldHold: true,
+            reason: "\(sourceReason) role=\(role) subrole=\(subrole)",
+            signature: signature
+        )
     }
     if hasInputAncestor(element) {
-        return (true, "\(sourceReason) via=ancestor role=\(role) subrole=\(subrole)", signature)
+        return FocusDetectionState(
+            shouldHold: true,
+            reason: "\(sourceReason) via=ancestor role=\(role) subrole=\(subrole)",
+            signature: signature
+        )
     }
     if hasFocusedInputDescendant(element) {
-        return (true, "\(sourceReason) via=descendant role=\(role) subrole=\(subrole)", signature)
+        return FocusDetectionState(
+            shouldHold: true,
+            reason: "\(sourceReason) via=descendant role=\(role) subrole=\(subrole)",
+            signature: signature
+        )
     }
-    return (false, "\(sourceReason) role=\(role) subrole=\(subrole)", signature)
+    return FocusDetectionState(
+        shouldHold: false,
+        reason: "\(sourceReason) role=\(role) subrole=\(subrole)",
+        signature: signature
+    )
 }
 
 func postFn(pressed: Bool) {
@@ -376,6 +511,7 @@ print("[auto-fn] started")
 print("[auto-fn] grant Accessibility permission to your terminal app, then re-run if needed.")
 print("[auto-fn] AXIsProcessTrusted=\(AXIsProcessTrusted())")
 print("[auto-fn] hotkey=\(configuredHotkey.spec)")
+print("[auto-fn] addressBarCountsAsInput=\(addressBarCountsAsInput)")
 if debugMode {
     print("[auto-fn] debug=on")
 }
@@ -394,7 +530,9 @@ signal(SIGTERM) { _ in
 var lastDebugSignature = ""
 var lastVerboseTs = Date().timeIntervalSince1970
 while shouldRun {
-    let (rawHold, reason, signatureInput) = shouldHoldFnForFocusedElement()
+    let detection = detectFocusedInputState()
+    let rawHold = detection.shouldHold
+    let reason = detection.reason
     let targetHold: Bool
     if rawHold {
         falseStreak = 0
@@ -420,7 +558,7 @@ while shouldRun {
             lastVerboseTs = now
         }
     }
-    setFnHeld(targetHold, signature: signatureInput)
+    setFnHeld(targetHold, signature: detection.signature)
     usleep(pollIntervalUsec)
 }
 

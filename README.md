@@ -27,3 +27,7 @@ open dist/AutoFn.app
 ## 注意
 
 - 需要在 macOS「系统设置 -> 隐私与安全性 -> 辅助功能」里给运行主体授权（终端或 AutoFnMenuBar.app）。
+
+## 参考
+
+- 本项目在输入框识别逻辑上参考了 [InputSourcePro](https://github.com/runjuu/InputSourcePro)。
