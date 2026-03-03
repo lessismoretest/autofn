@@ -297,9 +297,20 @@ final class AutoFnController {
     private var longPressActive = false
     private var pendingLongPressWorkItem: DispatchWorkItem?
     private let longPressThreshold: TimeInterval = 0.30
+    private var voiceAutoSubmitTracking = false
+    private var voiceAutoSubmitPending = false
+    private var voiceAutoSubmitBaselineText = ""
+    private var voiceAutoSubmitSignature = ""
+    private var voiceAutoSubmitDeadline: TimeInterval = 0
+    private let voiceAutoSubmitTimeout: TimeInterval = 0
+    private var voiceAutoSubmitHasObservedChange = false
+    private var voiceAutoSubmitLastObservedText = ""
+    private var voiceAutoSubmitLastChangeAt: TimeInterval = 0
+    private let voiceAutoSubmitStabilityWindow: TimeInterval = 1.0
     var triggerHotkey = Hotkey(keyCode: 18, flags: .maskCommand, spec: "cmd+1", holdMode: false)
     var triggerMode: TriggerMode = .focus
     var addressBarCountsAsInput = true
+    var autoPressEnterAfterVoiceFill = false
     var onTestPrompt: ((String, CGRect?) -> Void)?
 
     func start() {
@@ -314,6 +325,7 @@ final class AutoFnController {
         timer = nil
         cancelPendingLongPress()
         longPressActive = false
+        clearVoiceAutoSubmitState()
         setFnHeld(false)
     }
 
@@ -322,6 +334,7 @@ final class AutoFnController {
         if !value {
             cancelPendingLongPress()
             longPressActive = false
+            clearVoiceAutoSubmitState()
             setFnHeld(false)
         }
     }
@@ -333,6 +346,7 @@ final class AutoFnController {
         longPressArmed = false
         longPressActive = false
         falseStreak = 0
+        clearVoiceAutoSubmitState()
         setFnHeld(false)
     }
 
@@ -378,6 +392,7 @@ final class AutoFnController {
             setFnHeld(false)
             return
         }
+        processVoiceAutoSubmitIfNeeded()
         guard triggerMode == .focus else { return }
         let focusState = detectFocusedInputState()
         let rawHold = focusState.shouldHold
@@ -395,6 +410,7 @@ final class AutoFnController {
     private func setFnHeld(_ target: Bool, signature: String = "", focusRect: CGRect? = nil) {
         if triggerHotkey.holdMode {
             if fnHeld != target {
+                handleHoldModeTransition(nextHeld: target)
                 postFn(pressed: target)
                 fnHeld = target
             }
@@ -427,6 +443,88 @@ final class AutoFnController {
             lastInputSignature = ""
             lastInputRect = nil
         }
+    }
+
+    private func handleHoldModeTransition(nextHeld: Bool) {
+        guard autoPressEnterAfterVoiceFill else {
+            clearVoiceAutoSubmitState()
+            return
+        }
+        if nextHeld {
+            guard let element = focusedElement() else {
+                clearVoiceAutoSubmitState()
+                return
+            }
+            voiceAutoSubmitBaselineText = readInputValueText(element) ?? ""
+            voiceAutoSubmitSignature = focusedElementSignature(element)
+            voiceAutoSubmitTracking = true
+            voiceAutoSubmitPending = false
+            voiceAutoSubmitDeadline = 0
+            voiceAutoSubmitHasObservedChange = false
+            voiceAutoSubmitLastObservedText = voiceAutoSubmitBaselineText
+            voiceAutoSubmitLastChangeAt = 0
+            return
+        }
+        if voiceAutoSubmitTracking {
+            voiceAutoSubmitPending = true
+            if voiceAutoSubmitTimeout > 0 {
+                voiceAutoSubmitDeadline = Date().timeIntervalSince1970 + voiceAutoSubmitTimeout
+            } else {
+                voiceAutoSubmitDeadline = 0
+            }
+            voiceAutoSubmitLastObservedText = voiceAutoSubmitBaselineText
+            voiceAutoSubmitLastChangeAt = Date().timeIntervalSince1970
+        } else {
+            clearVoiceAutoSubmitState()
+        }
+    }
+
+    private func processVoiceAutoSubmitIfNeeded() {
+        guard autoPressEnterAfterVoiceFill else {
+            clearVoiceAutoSubmitState()
+            return
+        }
+        guard voiceAutoSubmitPending else { return }
+        if voiceAutoSubmitDeadline > 0, Date().timeIntervalSince1970 > voiceAutoSubmitDeadline {
+            clearVoiceAutoSubmitState()
+            return
+        }
+        guard let element = focusedElement() else { return }
+        if focusedElementSignature(element) != voiceAutoSubmitSignature {
+            clearVoiceAutoSubmitState()
+            return
+        }
+        guard let currentText = readInputValueText(element) else { return }
+        let now = Date().timeIntervalSince1970
+        if currentText != voiceAutoSubmitLastObservedText {
+            voiceAutoSubmitLastObservedText = currentText
+            voiceAutoSubmitLastChangeAt = now
+        }
+        if !voiceAutoSubmitHasObservedChange {
+            if currentText == voiceAutoSubmitBaselineText {
+                return
+            }
+            voiceAutoSubmitHasObservedChange = true
+            voiceAutoSubmitLastChangeAt = now
+            return
+        }
+        guard !currentText.isEmpty else { return }
+        if now - voiceAutoSubmitLastChangeAt < voiceAutoSubmitStabilityWindow {
+            return
+        }
+        sendEnterKey()
+        clearVoiceAutoSubmitState()
+    }
+
+    private func clearVoiceAutoSubmitState() {
+        voiceAutoSubmitTracking = false
+        voiceAutoSubmitPending = false
+        voiceAutoSubmitBaselineText = ""
+        voiceAutoSubmitSignature = ""
+        voiceAutoSubmitDeadline = 0
+        voiceAutoSubmitHasObservedChange = false
+        voiceAutoSubmitLastObservedText = ""
+        voiceAutoSubmitLastChangeAt = 0
     }
 }
 
@@ -745,6 +843,27 @@ func sendHotkey(_ hotkey: Hotkey) {
     keyUp.post(tap: .cghidEventTap)
 }
 
+func sendEnterKey() {
+    guard let source = CGEventSource(stateID: .hidSystemState) else { return }
+    guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
+          let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false)
+    else { return }
+    keyDown.post(tap: .cghidEventTap)
+    keyUp.post(tap: .cghidEventTap)
+}
+
+func readInputValueText(_ element: AXUIElement) -> String? {
+    let (err, value) = copyAttr(element, kAXValueAttribute as CFString)
+    guard err == .success, let raw = value else { return nil }
+    if let text = raw as? String {
+        return text
+    }
+    if let attributed = raw as? NSAttributedString {
+        return attributed.string
+    }
+    return nil
+}
+
 func openAccessibilitySettings() {
     if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
         NSWorkspace.shared.open(url)
@@ -757,12 +876,14 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
     private let enabledMenuItem = NSMenuItem(title: "Enabled", action: #selector(toggleEnabled), keyEquivalent: "e")
     private let launchAtLoginMenuItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "l")
     private let addressBarInputMenuItem = NSMenuItem(title: "Address Bar Counts As Input", action: #selector(toggleAddressBarCountsAsInput), keyEquivalent: "")
+    private let autoEnterAfterVoiceMenuItem = NSMenuItem(title: "Auto Press Enter After Voice Fill (Experimental)", action: #selector(toggleAutoEnterAfterVoiceFill), keyEquivalent: "")
     private let triggerModeMenuItem = NSMenuItem(title: "Trigger Mode", action: nil, keyEquivalent: "")
     private let hotkeyMenuItem = NSMenuItem(title: "Trigger Hotkey", action: nil, keyEquivalent: "")
     private let accessMenuItem = NSMenuItem(title: "Open Accessibility Settings", action: #selector(openAccessibility), keyEquivalent: "")
     private let launchAgentLabel = "com.lessismore.autofnmenubar.login"
     private let hotkeyDefaultsKey = "AutoFnMenuBar.TriggerHotkeySpec"
     private let addressBarInputDefaultsKey = "AutoFnMenuBar.AddressBarCountsAsInput"
+    private let autoEnterAfterVoiceDefaultsKey = "AutoFnMenuBar.AutoPressEnterAfterVoiceFill"
     private let triggerModeDefaultsKey = "AutoFnMenuBar.TriggerMode"
     private let hotkeyPresets = ["test", "fn", "cmd+1", "ctrl+space", "cmd+space", "alt+space"]
     private let focusObserverManager = FocusAXObserverManager()
@@ -775,6 +896,7 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
         setupStatusItem()
         loadHotkeyFromDefaults()
         loadAddressBarInputFromDefaults()
+        loadAutoEnterAfterVoiceFillFromDefaults()
         loadTriggerModeFromDefaults()
         controller.onTestPrompt = { [weak self] message, rect in
             self?.showTestPrompt(message, near: rect)
@@ -867,6 +989,10 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
         addressBarInputMenuItem.state = controller.addressBarCountsAsInput ? .on : .off
         menu.addItem(addressBarInputMenuItem)
 
+        autoEnterAfterVoiceMenuItem.target = self
+        autoEnterAfterVoiceMenuItem.state = controller.autoPressEnterAfterVoiceFill ? .on : .off
+        menu.addItem(autoEnterAfterVoiceMenuItem)
+
         triggerModeMenuItem.submenu = makeTriggerModeSubmenu()
         menu.addItem(triggerModeMenuItem)
 
@@ -939,6 +1065,11 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
             controller.addressBarCountsAsInput = UserDefaults.standard.bool(forKey: addressBarInputDefaultsKey)
         }
         addressBarInputMenuItem.state = controller.addressBarCountsAsInput ? .on : .off
+    }
+
+    private func loadAutoEnterAfterVoiceFillFromDefaults() {
+        controller.autoPressEnterAfterVoiceFill = UserDefaults.standard.bool(forKey: autoEnterAfterVoiceDefaultsKey)
+        autoEnterAfterVoiceMenuItem.state = controller.autoPressEnterAfterVoiceFill ? .on : .off
     }
 
     private func loadTriggerModeFromDefaults() {
@@ -1078,6 +1209,12 @@ final class AutoFnMenuBarApp: NSObject, NSApplicationDelegate {
         controller.addressBarCountsAsInput.toggle()
         UserDefaults.standard.set(controller.addressBarCountsAsInput, forKey: addressBarInputDefaultsKey)
         addressBarInputMenuItem.state = controller.addressBarCountsAsInput ? .on : .off
+    }
+
+    @objc private func toggleAutoEnterAfterVoiceFill() {
+        controller.autoPressEnterAfterVoiceFill.toggle()
+        UserDefaults.standard.set(controller.autoPressEnterAfterVoiceFill, forKey: autoEnterAfterVoiceDefaultsKey)
+        autoEnterAfterVoiceMenuItem.state = controller.autoPressEnterAfterVoiceFill ? .on : .off
     }
 
     @objc private func selectHotkeyPreset(_ sender: NSMenuItem) {
