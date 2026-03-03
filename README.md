@@ -28,6 +28,9 @@ open dist/AutoFn.app
 - `Focus/Blur`（原方案）
 - `Long Press In Input`（在输入框内长按左键触发，松开结束）
 
+实验性功能：
+- `Auto Press Enter After Voice Fill (Experimental)`：语音回填后，检测输入框文本稳定 1 秒自动按回车（用于自动发送/搜索）。
+
 DMG 打包：
 
 ```bash
